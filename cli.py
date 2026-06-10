@@ -122,10 +122,81 @@ def walk_forward(_args) -> None:
 
 
 def _build_backtest_fn(_cfg):
-    def backtest_fn(config, start, end):
-        raise NotImplementedError(
-            "wire a backtest_fn: load Alpaca historical news+bars for the window, "
-            "run backtest.engine.Backtester, return its report dict")
+    """
+    Return a backtest_fn(config, start, end) -> report dict suitable for
+    walk-forward validation.
+
+    Called once before the fold loop; the returned closure is invoked once per
+    fold (typically ~8 folds over a 400-day window).  Each call:
+
+      1. Fetches historical news events for [start, end] via AlpacaNews.historical().
+         Events are re-sorted ascending by published_at after fetching so the engine
+         always receives a strictly ordered stream — point-in-time discipline starts here.
+
+      2. Fetches 1-minute bars for the same window (plus a warm-up buffer so the
+         first events have trailing history for the volume z-score) via BarStore.load().
+         price_at / volume_z_at use only bars timestamped <= the decision timestamp,
+         enforced by bisect_right inside BarStore — no future data leaks.
+
+      3. Constructs Backtester with a pessimistic CostModel (5 bps spread,
+         3 bps slippage, 0.25% taker fee) and the two point-in-time callables.
+
+      4. Runs the engine and returns its report dict.
+
+    Credential priority: ALPACA_API_SECRET (set in walk-forward.yml via repo
+    secrets) then ALPACA_SECRET_KEY (local .env).  Both names are kept so the
+    same code runs in Actions and locally without changes.
+    """
+    from data.news import AlpacaNews
+    from data.bars import BarStore
+    from backtest.engine import Backtester
+    from backtest.fills import CostModel
+    from core.universe import flat_universe
+
+    api_key = os.environ.get("ALPACA_API_KEY", "")
+    # Walk-forward workflow (Actions) exports ALPACA_API_SECRET; local .env uses
+    # ALPACA_SECRET_KEY.  Accept either so no env-specific branch is needed.
+    api_secret = (os.environ.get("ALPACA_API_SECRET")
+                  or os.environ.get("ALPACA_SECRET_KEY", ""))
+
+    # Construct the news client once — it is stateless across historical() calls.
+    news_src = AlpacaNews(api_key, api_secret)
+
+    def backtest_fn(config: dict, start: datetime, end: datetime) -> dict:
+        tickers = flat_universe(config)
+        n = config.get("params", {}).get("volume_zscore_lookback", 20)
+
+        print(f"[backtest] {start.date()} → {end.date()}  tickers={len(tickers)}")
+
+        # ── bars ──────────────────────────────────────────────────────────────
+        # Extend start backward by one full lookback window so that events at
+        # the very beginning of the fold already have N trailing bars available.
+        warmup = timedelta(minutes=(n + 1) * 3)
+        store = BarStore.load(api_key, api_secret, config, start - warmup, end)
+
+        # ── news ──────────────────────────────────────────────────────────────
+        # historical() already sorts by published_at, but sort explicitly here
+        # so the guarantee is local to this function and survives any future
+        # change to the news source implementation.
+        events = sorted(
+            news_src.historical(tickers, start, end),
+            key=lambda e: e.published_at,
+        )
+        print(f"[backtest]   {len(events)} news events loaded")
+
+        # ── engine ────────────────────────────────────────────────────────────
+        bt = Backtester(
+            config=config,
+            cost=CostModel(),          # pessimistic defaults: 5 bps spread,
+                                       # 3 bps slippage, 0.25% taker fee
+            price_at=store.price_at,   # close of last bar with timestamp <= ts
+            volume_z_at=store.volume_z_at,  # z-score using only bars <= ts
+        )
+        report = bt.run(events)
+        print(f"[backtest]   trades={report['trades']}  "
+              f"win_rate={report['win_rate']:.1%}  net_pnl={report['net_pnl']:.2f}")
+        return report
+
     return backtest_fn
 
 
