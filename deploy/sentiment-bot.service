@@ -1,0 +1,18 @@
+# The always-on trading loop. Copy to /etc/systemd/system/ and:
+#   sudo systemctl enable --now sentiment-bot
+[Unit]
+Description=Sentiment trading bot (live loop)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/sentiment_bot
+EnvironmentFile=/opt/sentiment_bot/.env
+ExecStart=/usr/bin/python3 /opt/sentiment_bot/cli.py run-live
+Restart=always
+RestartSec=10
+# Do NOT put ANTHROPIC_API_KEY here unless you intend API billing for any
+# Claude Code run on this box; the live loop itself doesn't need it.
+
+[Install]
+WantedBy=multi-user.target

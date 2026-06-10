@@ -1,13 +1,12 @@
+# secrets — never commit
 .env
+*.pem
+*.key
+
+# python
 __pycache__/
 *.pyc
-*.pyo
-.DS_Store
-venv/
 .venv/
-*.egg-info/
-dist/
-build/
-.pytest_cache/
-logs/
-*.log
+
+# generated report outputs are committed by Actions into reports/out/,
+# but local test runs shouldn't be — Actions manages that path in CI.

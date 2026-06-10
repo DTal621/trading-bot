@@ -1,0 +1,67 @@
+# strategy.yaml — the FROZEN, VERSIONED strategy spec.
+#
+# The live bot loads this once and never edits it. To change behaviour:
+#   1. edit values here
+#   2. bump `version` (this string is stamped onto every decision)
+#   3. re-run walk-forward; only deploy if it passes the promotion gate
+#
+# Bumping the version is what lets you evaluate each spec on its own
+# out-of-sample track record later. Treat it like a git tag for behaviour.
+
+version: "v1.0.0-baseline"
+
+# Universe organized by category. This is the SINGLE SOURCE OF TRUTH for which
+# tickers trade and which stop-loss applies to each. The flat list the runner and
+# news feed need is derived from this (see core/universe.py).
+# Stops are enforced broker-side (bracket/stop orders) at entry and honored in the
+# backtest, so live and backtest agree on when a stop fires.
+categories:
+  equities:
+    stop_loss_pct: 0.06           # exit if a position falls 6% from entry
+    tickers: [AAPL, MSFT, NVDA, AMZN]
+  crypto:
+    stop_loss_pct: 0.12           # wider — a tight stop would trip on crypto's normal range
+    tickers: ["BTC/USD", "ETH/USD"]   # spot crypto: cannot be shorted on Alpaca
+  commodities:
+    stop_loss_pct: 0.04           # ETF proxies (GLD gold, USO oil); tighter per your call
+    tickers: [GLD, USO]
+
+params:
+  entry_score_threshold: 0.40     # |aggregate sentiment| needed to act
+  min_confidence: 0.35            # below this, ignore (thin/ambiguous news)
+  volume_zscore_gate: 1.5         # require volume confirmation before entering
+  max_position_pct: 0.05          # max 5% of equity per name
+  news_window_seconds: 1800       # aggregate news over a trailing 30 min
+  news_half_life_seconds: 600     # recency decay: 10 min half-life
+
+backtest:
+  starting_equity: 100000
+  assumed_latency_seconds: 3      # you act AFTER the headline, not at it
+
+# Hard limits enforced in code (core/guardrails.py), NOT advisory.
+# The agent must never loosen these — tighten only. YOU may change them
+# deliberately (e.g. at go-live); the agent may not do it as a side effect.
+risk_limits:
+  # Going live is a deliberate human act done via the go-live checklist, never
+  # something the agent flips and never a side effect of a config change. Leave
+  # false during the paper phase; set true yourself, on purpose, when you cut over.
+  allow_real_money: false
+  max_order_notional: 10000
+  max_position_pct: 0.05          # per name — revisit ALL limits at go-live
+  max_gross_exposure_pct: 0.90    # up to 90% deployed; strategy chooses the mix freely
+  # NOTE: no max_open_positions. Position count is left to the strategy; the
+  # per-name and gross caps are the only concentration bounds (ruin-prevention,
+  # not a prescription of how many names or which categories to hold).
+  max_daily_loss_pct: 0.06        # kill switch halts NEW entries at -6% on the day
+
+# Change workflow: every change needs human approval AFTER it clears walk-forward,
+# then runs a shadow A/B trial before it can be adopted permanently.
+change_workflow:
+  require_human_approval: true
+  trial_days: 14
+  shadow_ab: true                 # run the previous version logged-only during the trial
+
+# Model used by the daily LLM review (analysis/llm_review.py). A Sonnet-class
+# model is plenty; set to whatever is current when you build.
+llm_review:
+  model: "claude-sonnet-4-5"

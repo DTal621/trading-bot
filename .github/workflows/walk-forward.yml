@@ -1,0 +1,36 @@
+name: walk-forward
+
+# Validates any PENDING_VALIDATION proposals on out-of-sample history, then
+# (on pass) sends them to Telegram for your approval. Heavy backtest compute
+# lives here, off the tiny instance. Run weekly or on demand.
+on:
+  schedule:
+    - cron: '0 6 * * 0'       # Sundays 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  walkforward:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: Validate pending proposals
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python cli.py walk-forward
+      - name: Commit validation results
+        run: |
+          git config user.name "sentiment-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state
+          git commit -m "walk-forward results $(date -u +%F)" || echo "nothing to commit"
+          git push || echo "nothing to push"

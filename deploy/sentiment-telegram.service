@@ -1,0 +1,16 @@
+# Always-on Telegram listener: receives approve/reject/keep/cancel and actuates.
+# Separate from the trading loop so a listener restart never touches live trading.
+[Unit]
+Description=Sentiment bot Telegram listener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/sentiment_bot
+EnvironmentFile=/opt/sentiment_bot/.env
+ExecStart=/usr/bin/python3 /opt/sentiment_bot/cli.py telegram-listen
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

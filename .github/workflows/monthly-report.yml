@@ -1,0 +1,31 @@
+name: monthly-report
+
+on:
+  schedule:
+    - cron: '0 12 1 * *'      # 1st of month, 12:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  monthly:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: Build and send monthly report
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python cli.py monthly-report
+      - name: Commit report
+        run: |
+          git config user.name "sentiment-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add reports/out
+          git commit -m "monthly report $(date -u +%F)" || echo "nothing to commit"
+          git push || echo "nothing to push"
