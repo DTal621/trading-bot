@@ -13,7 +13,6 @@ the spec, bump the version, re-validate, redeploy.
 from __future__ import annotations
 
 import os
-import statistics
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
@@ -26,6 +25,7 @@ from alpaca.data.historical.crypto import CryptoHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
+from core.bar_features import volume_zscore
 from core.schema import utcnow, Action
 from core.signals import LexiconScorer, build_signal
 from core.strategy import decide
@@ -66,8 +66,6 @@ class BarCache:
       TimeFrame.Minute  (1-minute convenience constant)
     """
 
-    _STD_FLOOR = 1e-9   # treat population std below this as zero to avoid div/0
-
     def __init__(self, api_key: str, api_secret: str, config: dict) -> None:
         self._stock_client = StockHistoricalDataClient(api_key, api_secret)
         self._crypto_client = CryptoHistoricalDataClient(api_key, api_secret)
@@ -94,21 +92,7 @@ class BarCache:
           - any fetch error occurred
         """
         bars = self._get_bars(ticker)
-        n = self._n
-
-        if len(bars) < n + 1:
-            return 0.0
-
-        current_vol: float = bars[-1].volume
-        window_vols: list[float] = [b.volume for b in bars[-(n + 1):-1]]
-
-        mean = statistics.mean(window_vols)
-        std = statistics.pstdev(window_vols)   # population std: window is our full reference
-
-        if std < self._STD_FLOOR:
-            return 0.0
-
-        return (current_vol - mean) / std
+        return volume_zscore(bars, self._n)
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
