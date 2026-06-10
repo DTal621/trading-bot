@@ -33,6 +33,7 @@ params:
   max_position_pct: 0.05          # max 5% of equity per name
   news_window_seconds: 1800       # aggregate news over a trailing 30 min
   news_half_life_seconds: 600     # recency decay: 10 min half-life
+  volume_zscore_lookback: 20      # trailing bars for volume z-score (N; current bar is the N+1th)
 
 backtest:
   starting_equity: 100000
