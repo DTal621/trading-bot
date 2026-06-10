@@ -76,6 +76,16 @@ def approve(proposal_id: str, backlog: ProposalBacklog, base_config: dict,
 
 def finalize(proposal_id: str, backlog: ProposalBacklog, deployer: Deployer,
              log: DecisionLog, approval: ApprovalChannel, now: datetime | None = None) -> str:
+    """
+    Process a keep/cancel decision for a completed trial.
+
+    Sending the trial prompt and acting on the response are intentionally
+    separated: check_expired_trials() sends the prompt (once), and this
+    function acts on whatever the human replies.  If the prompt has not been
+    sent yet (e.g. called directly before the daily job ran), this function
+    sends it — but it will not re-send if mark_trial_prompt_sent() was already
+    called, so the two code paths are safe to coexist.
+    """
     now = now or utcnow()
     window = TrialWindow(
         candidate_version=backlog.payload(proposal_id, "candidate_version"),
@@ -86,7 +96,11 @@ def finalize(proposal_id: str, backlog: ProposalBacklog, deployer: Deployer,
     if not window.is_complete(now):
         return "trial still running"
 
-    approval.send_trial_decision(proposal_id, build_trial_report(log, window, now))
+    # Only send the prompt if it hasn't been dispatched yet (idempotency guard).
+    if not backlog.trial_prompt_sent(proposal_id):
+        approval.send_trial_decision(proposal_id, build_trial_report(log, window, now))
+        backlog.mark_trial_prompt_sent(proposal_id)
+
     decision = approval.poll_decision(proposal_id)  # expect 'keep' or 'cancel'
     if decision == "cancel":
         deployer.revert_to(window.incumbent_version)
@@ -97,6 +111,65 @@ def finalize(proposal_id: str, backlog: ProposalBacklog, deployer: Deployer,
         backlog.transition(proposal_id, ProposalStatus.ADOPTED)
         return f"adopted {window.candidate_version}"
     return "awaiting keep/cancel decision"
+
+
+def check_expired_trials(backlog: ProposalBacklog, log: DecisionLog,
+                         approval: ApprovalChannel, deployer: Deployer,
+                         config: dict, now: datetime | None = None) -> list[str]:
+    """
+    Send the Keep/Cancel trial prompt for every DEPLOYED_TRIAL proposal whose
+    trial window has closed, exactly once.
+
+    Designed to run inside the daily-report job (or any scheduled check).
+    Call this after the daily report has been sent so the prompt arrives as a
+    separate message and is easy to action.
+
+    Returns a list of status strings (one per checked proposal) for logging.
+
+    Idempotency guarantee:
+      - mark_trial_prompt_sent() is written to the backlog before this function
+        returns, so a crash after the send but before the write is the only gap.
+        In that case the prompt would be re-sent on the next daily run — a
+        duplicate Telegram message is a minor nuisance, not a correctness bug,
+        and is far better than silently missing the notification.
+      - A proposal that has already been finalized (ADOPTED / REVERTED) will not
+        be returned by by_status(DEPLOYED_TRIAL), so it is never checked here.
+    """
+    now = now or utcnow()
+    results: list[str] = []
+
+    for p in backlog.by_status(ProposalStatus.DEPLOYED_TRIAL):
+        pid = p["proposal_id"]
+
+        trial_end_raw = backlog.payload(pid, "trial_end")
+        if trial_end_raw is None:
+            results.append(f"{pid[:8]}: missing trial_end — skipped")
+            continue
+
+        trial_end = datetime.fromisoformat(trial_end_raw)
+        if now < trial_end:
+            results.append(f"{pid[:8]}: trial still running until {trial_end.date()}")
+            continue
+
+        if backlog.trial_prompt_sent(pid):
+            results.append(f"{pid[:8]}: prompt already sent — awaiting keep/cancel")
+            continue
+
+        # Window is closed and prompt has not been sent yet — send it now.
+        window = TrialWindow(
+            candidate_version=backlog.payload(pid, "candidate_version"),
+            incumbent_version=backlog.payload(pid, "incumbent_version"),
+            start=datetime.fromisoformat(backlog.payload(pid, "trial_start")),
+            end=trial_end,
+        )
+        report = build_trial_report(log, window, now)
+        approval.send_trial_decision(pid, report)
+        backlog.mark_trial_prompt_sent(pid)
+        results.append(f"{pid[:8]}: trial expired {trial_end.date()} — Keep/Cancel prompt sent")
+        print(f"[trial] {pid[:8]}: window closed {trial_end.date()}, "
+              f"Keep/Cancel prompt dispatched")
+
+    return results
 
 
 def _next_version(base_config: dict, p: dict) -> str:

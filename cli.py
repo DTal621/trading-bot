@@ -82,10 +82,17 @@ def _write(path: Path, text: str) -> None:
 def daily_report(_args) -> None:
     cfg, log = _config(), DecisionLog(LOG_PATH)
     backlog, appr = ProposalBacklog(BACKLOG_PATH), _approval()
+    dep = Deployer(VERSIONS, LIVE_PTR)
     res = review(log, backlog, cfg, _call_model(cfg))
     rep = build_daily_report(log, date.today(), backlog, res["observations"])
     _write(OUT / "daily" / f"{date.today().isoformat()}.md", rep)
     appr.send_report(rep)
+    # Check for trials whose window has closed and send the Keep/Cancel prompt
+    # exactly once per trial. This runs after the daily report so the two
+    # messages are distinct and easy to action separately.
+    from ops.change_pipeline import check_expired_trials
+    for msg in check_expired_trials(backlog, log, appr, dep, cfg):
+        print(f"[trial-check] {msg}")
 
 
 def _period(label: str, days: int) -> None:

@@ -118,6 +118,28 @@ class ProposalBacklog:
                     val = rec["payload"][key]
         return val
 
+    # ── Trial-prompt tracking ──────────────────────────────────────────────────
+
+    def mark_trial_prompt_sent(self, proposal_id: str) -> None:
+        """
+        Record that the Keep/Cancel trial prompt was sent for this proposal.
+        Written as a lightweight non-transition event so it survives restarts
+        without needing a new ProposalStatus value.
+        """
+        self._write({
+            "event": "trial_prompt_sent",
+            "proposal_id": proposal_id,
+            "at": utcnow().isoformat(),
+        })
+
+    def trial_prompt_sent(self, proposal_id: str) -> bool:
+        """Return True if the Keep/Cancel prompt has already been sent."""
+        for rec in self._read():
+            if (rec.get("event") == "trial_prompt_sent"
+                    and rec.get("proposal_id") == proposal_id):
+                return True
+        return False
+
     def _current_status(self, proposal_id: str) -> str:
         _, latest = self._reconstruct()
         return latest.get(proposal_id, ProposalStatus.PENDING_VALIDATION.value)

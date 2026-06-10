@@ -27,6 +27,7 @@ from alpaca.data.timeframe import TimeFrame
 
 from core.bar_features import volume_zscore
 from core.schema import utcnow, Action
+from live.reconcile import StopReconciler
 from core.signals import LexiconScorer, build_signal
 from core.strategy import decide
 from core.broker import Broker
@@ -166,12 +167,19 @@ def run(config_path: str, broker: Broker, news: NewsSource, log: DecisionLog,
     guardrails = Guardrails(RiskLimits(**config.get("risk_limits", {})))
     day_start_equity = broker.equity()
 
+    _api_key    = os.environ.get("ALPACA_API_KEY", "")
+    _api_secret = os.environ.get("ALPACA_SECRET_KEY", "")
+
     # Bar cache: one fetch per ticker per minute, shared across all news events.
-    # Credentials come from env — the same vars cli.py uses to wire the broker.
-    bar_cache = BarCache(
-        api_key=os.environ.get("ALPACA_API_KEY", ""),
-        api_secret=os.environ.get("ALPACA_SECRET_KEY", ""),
-        config=config,
+    bar_cache = BarCache(api_key=_api_key, api_secret=_api_secret, config=config)
+
+    # Stop reconciler: detects bracket stop fills and writes synthetic EXIT +
+    # Outcome records so the log stays complete when Alpaca closes a position
+    # without going through our signal path.  Seeded from the log on startup
+    # so it survives restarts idempotently.
+    reconciler = StopReconciler(
+        api_key=_api_key, api_secret=_api_secret,
+        broker=broker, log=log,
     )
 
     recent: dict[str, deque] = defaultdict(deque)
@@ -241,6 +249,24 @@ def run(config_path: str, broker: Broker, news: NewsSource, log: DecisionLog,
                                 decision.target_qty, config)
             order = broker.submit(decision, stop_price=sp)
             log.append("order", order)
+
+            # Keep the reconciler's entry register in sync with broker state.
+            # clear_entry MUST come before register_entry on the same ticker
+            # and before maybe_reconcile() to prevent a false stop-exit log.
+            if decision.action in (Action.BUY, Action.SELL):
+                reconciler.register_entry(
+                    ticker=decision.ticker,
+                    decision_id=decision.decision_id,
+                    entry_price=market_features["last_price"],
+                    entry_ts=now,
+                    qty=decision.target_qty,
+                )
+            elif decision.action == Action.EXIT:
+                reconciler.clear_entry(decision.ticker)
+
+        # Reconcile at most once per minute: detect any bracket stops that
+        # filled since the last check and write their synthetic EXIT + Outcome.
+        reconciler.maybe_reconcile(config, log)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
