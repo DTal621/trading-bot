@@ -210,9 +210,59 @@ def _build_backtest_fn(_cfg):
 # --- Instance jobs ------------------------------------------------------------
 
 def run_live(_args) -> None:
-    print("run-live: wire AlpacaPaperBroker + AlpacaNews from env, then call "
-          "live.runner.run(config_path, broker, news, log[, shadow_config]).")
-    raise SystemExit("not wired: provide broker + news (see core/broker.py, data/news.py)")
+    api_key    = os.environ.get("ALPACA_API_KEY", "")
+    api_secret = (os.environ.get("ALPACA_API_SECRET")
+                  or os.environ.get("ALPACA_SECRET_KEY", ""))
+    if not api_key or not api_secret:
+        raise SystemExit("run-live requires ALPACA_API_KEY and ALPACA_API_SECRET (or ALPACA_SECRET_KEY)")
+
+    from core.broker import AlpacaPaperBroker
+    from data.news import AlpacaNews
+    from live.runner import run as runner_run
+
+    # Resolve the live config path (versioned if deployed, else the repo default).
+    dep = Deployer(VERSIONS, LIVE_PTR)
+    live_ver = dep.live_version()
+    if live_ver:
+        config_path = str(VERSIONS / f"{live_ver}.yaml")
+    else:
+        config_path = str(ROOT / "config" / "strategy.yaml")
+
+    # Read the config once here so we can extract the assumed-latency setting
+    # and check for an active trial — runner.run() re-reads from the path itself.
+    import yaml as _yaml
+    with open(config_path) as _f:
+        cfg = _yaml.safe_load(_f)
+
+    assumed_latency_s = cfg.get("params", {}).get("news_assumed_latency_s", 2.0)
+
+    broker = AlpacaPaperBroker(api_key, api_secret)
+    news   = AlpacaNews(api_key, api_secret, assumed_latency_s=assumed_latency_s)
+    log    = DecisionLog(LOG_PATH)
+
+    # If a proposal is mid-trial, load the incumbent version's config so the
+    # shadow A/B leg runs alongside live.  There can be at most one active trial
+    # at a time (the state machine enforces it), so we take the first hit.
+    shadow_config = None
+    backlog = ProposalBacklog(BACKLOG_PATH)
+    trials = backlog.by_status(ProposalStatus.DEPLOYED_TRIAL)
+    if trials:
+        trial = trials[0]
+        incumbent_ver = backlog.payload(trial["proposal_id"], "incumbent_version")
+        if incumbent_ver:
+            incumbent_path = VERSIONS / f"{incumbent_ver}.yaml"
+            if incumbent_path.exists():
+                with open(incumbent_path) as _f:
+                    shadow_config = _yaml.safe_load(_f)
+                print(f"run-live: shadow A/B active — incumbent {incumbent_ver} "
+                      f"(proposal {trial['proposal_id'][:8]})")
+            else:
+                print(f"run-live: WARNING incumbent version file not found "
+                      f"({incumbent_ver}.yaml) — running without shadow")
+
+    print(f"run-live: starting loop  config={config_path}  "
+          f"shadow={'yes' if shadow_config else 'no'}")
+    runner_run(config_path, broker, news, log, shadow_config=shadow_config)
 
 
 def telegram_listen(_args) -> None:
