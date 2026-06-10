@@ -168,7 +168,8 @@ def run(config_path: str, broker: Broker, news: NewsSource, log: DecisionLog,
     day_start_equity = broker.equity()
 
     _api_key    = os.environ.get("ALPACA_API_KEY", "")
-    _api_secret = os.environ.get("ALPACA_SECRET_KEY", "")
+    _api_secret = (os.environ.get("ALPACA_API_SECRET")
+                   or os.environ.get("ALPACA_SECRET_KEY", ""))
 
     # Bar cache: one fetch per ticker per minute, shared across all news events.
     bar_cache = BarCache(api_key=_api_key, api_secret=_api_secret, config=config)
