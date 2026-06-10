@@ -65,4 +65,4 @@ change_workflow:
 # Model used by the daily LLM review (analysis/llm_review.py). A Sonnet-class
 # model is plenty; set to whatever is current when you build.
 llm_review:
-  model: "claude-sonnet-4-5"
+  model: "claude-haiku-4-5"
