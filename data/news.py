@@ -25,10 +25,13 @@ SDK surface verified against alpaca-py source + live probe 2026-06:
 """
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from typing import Protocol, Iterator, Iterable
 from datetime import datetime, timedelta
+
+log = logging.getLogger(__name__)
 
 from alpaca.data.historical.news import NewsClient
 from alpaca.data.requests import NewsRequest
@@ -123,10 +126,27 @@ class AlpacaNews:
 
         Multi-ticker articles emit one event per symbol in the tracked set,
         identical to historical() — same normalization path, same guarantees.
+
+        Subscribe / symbol-format notes
+        --------------------------------
+        We subscribe to "*" (all news) rather than per-symbol.  Per-symbol
+        subscription can trigger a 400 "invalid syntax" rejection from Alpaca
+        for certain symbol formats (e.g. crypto pairs such as BTC/USD).  The
+        SDK logs the 400 and keeps the thread alive, but the subscription is
+        silently dead and no events ever flow.  Subscribing to "*" and filtering
+        locally in the handler is equivalent and avoids the format issue entirely.
+
+        Fail-fast behaviour
+        -------------------
+        If the stream thread exits for any reason (auth failure, network error,
+        normal return) a sentinel is placed on the queue and the main thread
+        raises RuntimeError so the process exits non-zero and systemd can
+        restart it.  A 120-second timeout on queue.get() provides a secondary
+        check: if the thread is dead and no sentinel arrived, we raise then too.
         """
-        ticker_list = list(tickers)
-        ticker_set = set(ticker_list)
-        event_queue: queue.Queue[NewsEvent] = queue.Queue()
+        ticker_set = set(tickers)
+        event_queue: queue.Queue = queue.Queue()
+        _STOP = object()   # sentinel: stream thread has exited
 
         ws = NewsDataStream(self._api_key, self._api_secret)
 
@@ -136,15 +156,42 @@ class AlpacaNews:
             for ticker in matching:
                 event_queue.put(self._make_event(article, ticker, ingested_at))
 
-        ws.subscribe_news(_handler, *ticker_list)
+        # Subscribe to all news; filter to our universe in _handler above.
+        # Avoids per-symbol 400 "invalid syntax" errors from Alpaca.
+        ws.subscribe_news(_handler, "*")
 
-        # Run the event loop in a daemon thread so it dies with the process.
-        t = threading.Thread(target=ws.run, daemon=True, name="alpaca-news-ws")
+        def _run() -> None:
+            try:
+                ws.run()
+            except Exception as exc:
+                log.error("alpaca news stream exited with error: %s", exc, exc_info=True)
+            finally:
+                # Always wake the main thread so it detects the exit rather
+                # than blocking on queue.get() indefinitely.
+                event_queue.put(_STOP)
+
+        t = threading.Thread(target=_run, daemon=True, name="alpaca-news-ws")
         t.start()
 
-        # Yield indefinitely; caller breaks out by stopping iteration or Ctrl-C.
         while True:
-            yield event_queue.get()
+            try:
+                item = event_queue.get(timeout=120)
+            except queue.Empty:
+                # 120 s with no data — verify the thread is still alive.
+                if not t.is_alive():
+                    raise RuntimeError(
+                        "alpaca news stream thread exited without sentinel "
+                        "— raising so systemd can restart the process"
+                    )
+                # Thread alive, just quiet (market closed / no news). Keep waiting.
+                log.debug("news stream alive but quiet (120 s timeout) — continuing")
+                continue
+            if item is _STOP:
+                raise RuntimeError(
+                    "alpaca news stream thread exited "
+                    "— raising so systemd can restart the process"
+                )
+            yield item
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
