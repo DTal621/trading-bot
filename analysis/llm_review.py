@@ -19,7 +19,11 @@ without letting a confident narrator tune your live money on a good Tuesday.
 from __future__ import annotations
 
 import json
+import logging
+import re
 from datetime import date
+
+log = logging.getLogger(__name__)
 
 from core.logstore import DecisionLog
 from core.proposals import ProposalBacklog, ChangeProposal
@@ -83,10 +87,14 @@ def review(log: DecisionLog, backlog: ProposalBacklog, current_config: dict,
     raw = call_model(SYSTEM_PROMPT, user)
 
     try:
-        parsed = json.loads(raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip())
+        parsed = json.loads(_extract_json(raw))
     except json.JSONDecodeError:
-        return {"observations": ["LLM review returned unparseable output; skipped."],
-                "proposals_added": 0}
+        snippet = raw[:300].replace("\n", " ")
+        log.error("LLM review returned unparseable JSON. raw (truncated): %r", snippet)
+        return {"observations": [
+                    f"LLM review returned unparseable output; skipped. "
+                    f"Raw (truncated): {snippet!r}"
+                ], "proposals_added": 0}
 
     added = 0
     for pr in parsed.get("proposals", []):
@@ -103,6 +111,30 @@ def review(log: DecisionLog, backlog: ProposalBacklog, current_config: dict,
         ))
         added += 1
     return {"observations": parsed.get("observations", []), "proposals_added": added}
+
+
+def _extract_json(raw: str) -> str:
+    """
+    Robustly extract a JSON object from a model response that may include:
+      - Markdown code fences  (```json ... ``` or ``` ... ```)
+      - Leading/trailing prose
+
+    Strategy:
+      1. Strip any opening ``` or ```json fence and closing ```.
+      2. Find the first '{' and last '}' and return that slice.
+         This discards any prose before or after the object.
+    """
+    # Remove opening fence (with optional language tag) and closing fence.
+    text = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip(), flags=re.IGNORECASE)
+    text = re.sub(r"\n?```\s*$", "", text.strip())
+    text = text.strip()
+
+    # Extract the outermost JSON object by brace positions.
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text   # let json.loads raise a clear error on whatever remains
 
 
 def _lookup(config: dict, dotted: str):
