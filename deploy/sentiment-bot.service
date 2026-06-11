@@ -6,6 +6,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+User=ubuntu
+Group=ubuntu
 WorkingDirectory=/opt/sentiment_bot
 EnvironmentFile=/opt/sentiment_bot/.env
 ExecStart=/usr/bin/python3 /opt/sentiment_bot/cli.py run-live

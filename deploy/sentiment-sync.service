@@ -3,6 +3,8 @@
 Description=Sync sentiment bot state to git
 
 [Service]
+User=ubuntu
+Group=ubuntu
 Type=oneshot
 WorkingDirectory=/opt/sentiment_bot
 EnvironmentFile=/opt/sentiment_bot/.env
