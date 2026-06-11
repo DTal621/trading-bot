@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from typing import Protocol, Iterator, Iterable
 from datetime import datetime, timedelta
 
@@ -116,6 +117,10 @@ class AlpacaNews:
             for ticker in matching:
                 yield self._make_event(article, ticker, ingested_at)
 
+    # Reconnect policy for stream().
+    _STREAM_MAX_ATTEMPTS = 5
+    _STREAM_BACKOFF_S    = [5, 15, 30, 60, 120]   # delay *before* each retry
+
     def stream(self, tickers: Iterable[str]) -> Iterator[NewsEvent]:
         """
         Yield live NewsEvents from Alpaca's WebSocket news feed.
@@ -136,62 +141,113 @@ class AlpacaNews:
         silently dead and no events ever flow.  Subscribing to "*" and filtering
         locally in the handler is equivalent and avoids the format issue entirely.
 
-        Fail-fast behaviour
-        -------------------
-        If the stream thread exits for any reason (auth failure, network error,
-        normal return) a sentinel is placed on the queue and the main thread
-        raises RuntimeError so the process exits non-zero and systemd can
-        restart it.  A 120-second timeout on queue.get() provides a secondary
-        check: if the thread is dead and no sentinel arrived, we raise then too.
+        Reconnect / fail-fast behaviour
+        --------------------------------
+        On disconnect the method attempts an in-process reconnect with
+        exponential backoff (up to _STREAM_MAX_ATTEMPTS times).  If any event
+        is received on a connection the attempt counter resets, so a transient
+        blip after a long healthy run does not consume retries.  After all
+        attempts are exhausted a RuntimeError is raised so the process exits
+        non-zero and systemd can restart it.
+
+        A dead stream thread can never leave the main loop blocked:
+          - The _run wrapper always puts a _STOP sentinel (try/finally).
+          - queue.get(timeout=120) + t.is_alive() check provides a secondary
+            guard if the sentinel is somehow lost.
+        Both of these break out of the inner drain loop and drive the reconnect
+        logic — silent-hang behaviour is structurally impossible.
         """
         ticker_set = set(tickers)
-        event_queue: queue.Queue = queue.Queue()
-        _STOP = object()   # sentinel: stream thread has exited
+        _STOP = object()   # sentinel: this connection's thread has exited
 
-        ws = NewsDataStream(self._api_key, self._api_secret)
+        attempt = 0
 
-        async def _handler(article) -> None:
-            ingested_at = utcnow()   # true wall-clock ingest time on live feed
-            matching = [s for s in article.symbols if s in ticker_set]
-            for ticker in matching:
-                event_queue.put(self._make_event(article, ticker, ingested_at))
-
-        # Subscribe to all news; filter to our universe in _handler above.
-        # Avoids per-symbol 400 "invalid syntax" errors from Alpaca.
-        ws.subscribe_news(_handler, "*")
-
-        def _run() -> None:
-            try:
-                ws.run()
-            except Exception as exc:
-                log.error("alpaca news stream exited with error: %s", exc, exc_info=True)
-            finally:
-                # Always wake the main thread so it detects the exit rather
-                # than blocking on queue.get() indefinitely.
-                event_queue.put(_STOP)
-
-        t = threading.Thread(target=_run, daemon=True, name="alpaca-news-ws")
-        t.start()
-
-        while True:
-            try:
-                item = event_queue.get(timeout=120)
-            except queue.Empty:
-                # 120 s with no data — verify the thread is still alive.
-                if not t.is_alive():
-                    raise RuntimeError(
-                        "alpaca news stream thread exited without sentinel "
-                        "— raising so systemd can restart the process"
-                    )
-                # Thread alive, just quiet (market closed / no news). Keep waiting.
-                log.debug("news stream alive but quiet (120 s timeout) — continuing")
-                continue
-            if item is _STOP:
-                raise RuntimeError(
-                    "alpaca news stream thread exited "
-                    "— raising so systemd can restart the process"
+        while attempt < self._STREAM_MAX_ATTEMPTS:
+            # Backoff before every retry (not before the first attempt).
+            if attempt > 0:
+                delay = self._STREAM_BACKOFF_S[
+                    min(attempt - 1, len(self._STREAM_BACKOFF_S) - 1)
+                ]
+                log.warning(
+                    "news stream disconnected — reconnect attempt %d/%d in %ds",
+                    attempt, self._STREAM_MAX_ATTEMPTS, delay,
                 )
-            yield item
+                time.sleep(delay)
+
+            # Fresh queue and WebSocket object for each attempt.  Capture them
+            # via default args (not closures) so each attempt's callbacks are
+            # bound to that attempt's queue, not whatever the variable points to
+            # when the callback eventually fires.
+            event_queue: queue.Queue = queue.Queue()
+            ws = NewsDataStream(self._api_key, self._api_secret)
+
+            async def _handler(
+                article,
+                _q=event_queue,
+                _ts=ticker_set,
+            ) -> None:
+                ingested_at = utcnow()
+                matching = [s for s in article.symbols if s in _ts]
+                for ticker in matching:
+                    _q.put(self._make_event(article, ticker, ingested_at))
+
+            # Subscribe to all news; filter to our universe in _handler.
+            ws.subscribe_news(_handler, "*")
+
+            def _run(_ws=ws, _q=event_queue) -> None:
+                try:
+                    _ws.run()
+                except Exception as exc:
+                    log.error(
+                        "news stream exited with error: %s", exc, exc_info=True
+                    )
+                finally:
+                    # Always unblock the drain loop so it can reconnect or exit.
+                    _q.put(_STOP)
+
+            t = threading.Thread(
+                target=_run, daemon=True,
+                name=f"alpaca-news-ws-{attempt + 1}",
+            )
+            t.start()
+            log.info(
+                "alpaca news stream started (attempt %d/%d)",
+                attempt + 1, self._STREAM_MAX_ATTEMPTS,
+            )
+            attempt += 1
+
+            # ── Drain this connection ──────────────────────────────────────────
+            while True:
+                try:
+                    item = event_queue.get(timeout=120)
+                except queue.Empty:
+                    # 120 s with no data — check the thread is still alive.
+                    if not t.is_alive():
+                        log.warning(
+                            "news stream thread died without sentinel "
+                            "— triggering reconnect"
+                        )
+                        break   # back to outer reconnect loop
+                    # Thread alive, market closed / no news. Keep waiting.
+                    log.debug(
+                        "news stream alive but quiet (120 s timeout) — continuing"
+                    )
+                    continue
+
+                if item is _STOP:
+                    log.warning("news stream thread exited — triggering reconnect")
+                    break   # back to outer reconnect loop
+
+                # Real event received: connection is healthy, reset attempt
+                # counter so this blip doesn't consume a permanent retry slot.
+                attempt = 0
+                yield item
+            # ── end drain loop ─────────────────────────────────────────────────
+
+        raise RuntimeError(
+            f"alpaca news stream failed after {self._STREAM_MAX_ATTEMPTS} attempts "
+            "— exiting non-zero so systemd can restart the process"
+        )
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
